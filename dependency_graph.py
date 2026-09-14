@@ -13,8 +13,10 @@ import argparse
 import json
 import re
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
+from pathlib import Path
 
 from openpyxl import load_workbook
 
@@ -214,27 +216,147 @@ class DependencyGraph:
         )
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description="Trace dependencies for Outputs cells in an Excel model.")
-    parser.add_argument("input", nargs="?", default="data/model.xlsx", help="Path to the Excel workbook")
-    parser.add_argument("-o", "--out", default="dependencies.json", help="Output JSON file")
-    parser.add_argument("--output-sheet", default="Outputs", help="Sheet to trace (default: Outputs)")
-    args = parser.parse_args(argv)
-
-    graph = DependencyGraph(args.input)
-    results = graph.trace_outputs(args.output_sheet)
-
-    payload = {
+def build_payload(source_path: str, results: dict, graph: DependencyGraph, output_sheet: str) -> dict:
+    """Build the output JSON payload for a single workbook."""
+    return {
         "meta": {
-            "source": args.input,
-            "output_sheet": args.output_sheet,
+            "source": source_path,
+            "output_sheet": output_sheet,
             "generated": datetime.now(timezone.utc).isoformat(),
-            "output_cells_with_formulas": graph.count_output_cells(args.output_sheet),
+            "output_cells_with_formulas": graph.count_output_cells(output_sheet),
             "output_cells_with_dependencies": len(results),
             "ignored_dynamic_refs": graph.dropped_refs,
         },
         "dependencies": dict(sorted(results.items())),
     }
+
+
+def process_file(file_path: str, output_sheet: str) -> tuple[dict, DependencyGraph]:
+    """Process a single Excel file and return (payload, graph).
+
+    Raises exceptions on failure so the caller can skip and continue.
+    """
+    graph = DependencyGraph(file_path)
+    results = graph.trace_outputs(output_sheet)
+    payload = build_payload(file_path, results, graph, output_sheet)
+    return payload, graph
+
+
+def process_directory(
+    input_dir: str,
+    output_dir: str,
+    output_sheet: str,
+    merge: bool = False,
+) -> int:
+    """Process all *.xlsx files in *input_dir*.
+
+    Returns 0 on success (even if some files failed), -1 on fatal error.
+    """
+    input_path = Path(input_dir)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    xlsx_files = sorted(input_path.glob("*.xlsx"))
+    if not xlsx_files:
+        print(f"No *.xlsx files found in '{input_dir}'.")
+        return 0
+
+    batch_t0 = time.time()
+    total = len(xlsx_files)
+    successful = 0
+    failed = 0
+    merged_results = {}
+
+    for idx, xlsx_file in enumerate(xlsx_files, 1):
+        t0 = time.time()
+        print(f"[{idx}/{total}] Processing: {xlsx_file.name}")
+        try:
+            payload, graph = process_file(str(xlsx_file), output_sheet)
+        except Exception as exc:
+            elapsed = time.time() - t0
+            print(f"  ERROR: {xlsx_file.name} — {exc} ({elapsed:.2f}s)")
+            failed += 1
+            continue
+
+        elapsed = time.time() - t0
+
+        if merge:
+            merged_results[xlsx_file.name] = payload
+        else:
+            out_name = xlsx_file.stem + "_dependencies.json"
+            out_file = output_path / out_name
+            with open(out_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+
+        successful += 1
+        cells = payload["meta"]["output_cells_with_dependencies"]
+        dropped = len(payload["meta"]["ignored_dynamic_refs"])
+        print(f"  → {cells} cells traced, {dropped} dynamic refs ignored ({elapsed:.2f}s)")
+
+    # Write merged output if requested
+    if merge and merged_results:
+        merged_payload = {
+            "meta": {
+                "source_dir": str(input_path),
+                "output_sheet": output_sheet,
+                "generated": datetime.now(timezone.utc).isoformat(),
+                "total_workbooks": total,
+                "successful": successful,
+                "failed": failed,
+            },
+            "workbooks": dict(sorted(merged_results.items())),
+        }
+        merged_file = output_path / "merged_dependencies.json"
+        with open(merged_file, "w", encoding="utf-8") as f:
+            json.dump(merged_payload, f, ensure_ascii=False, indent=2)
+        print(f"\nMerged output written to: {merged_file}")
+
+    total_elapsed = time.time() - batch_t0
+    print(f"\nDone. Successful: {successful}, Failed: {failed}, Total: {total} ({total_elapsed:.2f}s)")
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Trace dependencies for Outputs cells in an Excel model."
+    )
+    parser.add_argument(
+        "input", nargs="?", default=None,
+        help="Path to a single Excel workbook (use --input-dir for batch mode)"
+    )
+    parser.add_argument("-o", "--out", default="dependencies.json", help="Output JSON file (single-file mode)")
+    parser.add_argument("--output-sheet", default="Outputs", help="Sheet to trace (default: Outputs)")
+
+    # Batch-mode arguments
+    parser.add_argument(
+        "--input-dir", default=None,
+        help="Directory containing *.xlsx files to process (batch mode)"
+    )
+    parser.add_argument(
+        "--output-dir", default="results",
+        help="Directory for output JSON files (default: results/)"
+    )
+    parser.add_argument(
+        "--merge", action="store_true", default=False,
+        help="Merge all results into a single merged_dependencies.json"
+    )
+
+    args = parser.parse_args(argv)
+
+    # Batch mode
+    input_dir = args.input_dir or (args.input if args.input and Path(args.input).is_dir() else None)
+    if input_dir is not None and Path(input_dir).is_dir():
+        return process_directory(input_dir, args.output_dir, args.output_sheet, args.merge)
+
+    # Single-file mode (backward compatible)
+    if args.input is None:
+        parser.print_help()
+        return 0
+
+    graph = DependencyGraph(args.input)
+    results = graph.trace_outputs(args.output_sheet)
+
+    payload = build_payload(args.input, results, graph, args.output_sheet)
 
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
