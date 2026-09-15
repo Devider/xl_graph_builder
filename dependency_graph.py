@@ -563,26 +563,54 @@ def summarize_workbook(graph, name):
           f"{dropped} dynamic refs ignored")
 
 
-def print_skipped_summary(function_file_counts):
-    """Print a table of skipped functions broken down by file."""
+def print_skipped_summary(function_file_counts, transpose=False):
+    """Print a table of skipped functions broken down by file.
+
+    Default orientation: functions in rows, files in columns.
+    With transpose=True: files in rows, functions in columns.
+    Total counts are in the bottom row.
+    """
     if not function_file_counts:
         return
     files = sorted({f for counts in function_file_counts.values() for f in counts})
     funcs = sorted(function_file_counts)
-    col_w = max((len(f) for f in funcs), default=0)
-    file_ws = [max(len(f), 5) for f in files]
-    header = "Function".ljust(col_w) + "  " + "  ".join(f.ljust(w) for f, w in zip(files, file_ws)) + "  Total"
+    if transpose:
+        rows = files
+        row_ids = files
+        cols = funcs
+        col_ids = funcs
+        row_label = "File"
+        first_col_w = max((len(f) for f in files), default=0)
+    else:
+        rows = funcs
+        row_ids = funcs
+        cols = files
+        col_ids = files
+        row_label = "Function"
+        first_col_w = max((len(f) for f in funcs), default=0)
+    col_ws = [max(len(c), 5) for c in cols]
+    header = row_label.ljust(first_col_w) + "  " + "  ".join(c.ljust(w) for c, w in zip(cols, col_ws))
     sep = "=" * len(header)
     print(f"\n{sep}")
     print("Skipped functions by file")
     print(sep)
     print(header)
     print("-" * len(header))
-    for func in funcs:
-        counts = function_file_counts[func]
-        total = sum(counts.values())
-        cells = [str(counts.get(f, 0)).rjust(w) for f, w in zip(files, file_ws)]
-        print(f"{func.ljust(col_w)}  {'  '.join(cells)}  {str(total).rjust(5)}")
+    for rid in rows:
+        cells = []
+        for cid in col_ids:
+            if transpose:
+                cells.append(function_file_counts[cid].get(rid, 0))
+            else:
+                cells.append(function_file_counts[rid].get(cid, 0))
+        print(f"{rid.ljust(first_col_w)}  " + "  ".join(str(v).rjust(w) for v, w in zip(cells, col_ws)))
+    print("-" * len(header))
+    totals = []
+    if transpose:
+        totals = [sum(function_file_counts[cid].values()) for cid in cols]
+    else:
+        totals = [sum(function_file_counts[r].get(c, 0) for r in funcs) for c in cols]
+    print(f"{'Total'.ljust(first_col_w)}  " + "  ".join(str(v).rjust(w) for v, w in zip(totals, col_ws)))
     print(sep)
 
 
@@ -621,7 +649,7 @@ def process_single(file_path, out_path, output_sheet, no_save=False, timeout=0):
     return meta
 
 
-def process_directory(input_dir, output_dir, output_sheet, merge=False, no_save=False, timeout=0):
+def process_directory(input_dir, output_dir, output_sheet, merge=False, no_save=False, timeout=0, transpose=False):
     """Process all *.xlsx files in *input_dir*.
 
     Returns 0 on success (even if some files failed), -1 on fatal error.
@@ -717,7 +745,7 @@ def process_directory(input_dir, output_dir, output_sheet, merge=False, no_save=
 
     total_elapsed = time.time() - batch_t0
     print(f"\nDone. Successful: {successful}, Failed: {failed}, Total: {total} ({total_elapsed:.2f}s)")
-    print_skipped_summary(function_file_counts)
+    print_skipped_summary(function_file_counts, transpose)
     return 0
 
 
@@ -753,6 +781,10 @@ def main(argv=None):
         "--timeout", type=int, default=0,
         help="Max seconds per file (0 = no limit). Skips files that exceed this."
     )
+    parser.add_argument(
+        "--transpose", action="store_true", default=False,
+        help="Transpose the skipped-functions table: files in rows, functions in columns"
+    )
 
     args = parser.parse_args(argv)
 
@@ -760,7 +792,7 @@ def main(argv=None):
     input_dir = args.input_dir or (args.input if args.input and Path(args.input).is_dir() else None)
     if input_dir is not None and Path(input_dir).is_dir():
         return process_directory(input_dir, args.output_dir, args.output_sheet,
-                                 args.merge, args.no_save, args.timeout)
+                                 args.merge, args.no_save, args.timeout, args.transpose)
 
     # Single-file mode
     try:
