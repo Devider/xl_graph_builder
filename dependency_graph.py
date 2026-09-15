@@ -4,13 +4,18 @@
 For every formula cell on the "Outputs" sheet, collects all cells
 (transitively) whose values influence it, and writes the result as JSON.
 
-Complex dynamic references (INDIRECT / OFFSET) are deliberately ignored:
-the affected references are registered in the output metadata instead of
-being resolved.
-
-Memory-friendly: the workbook is read in streaming (read-only) mode and
-the result is streamed to disk cell-by-cell instead of being accumulated
-in memory.
+Highlights:
+- No third-party dependencies: the .xlsx is read straight from its XML
+  parts (zipfile + ElementTree), which is both fast and memory-friendly.
+- Shared formulas (Excel writes large contiguous ranges as a single
+  master formula) are resolved and their relative references are
+  translated cell-by-cell, like Excel does.
+- Complex dynamic references (INDIRECT / OFFSET) are deliberately
+  ignored: the affected references are registered in the output metadata
+  instead of being resolved.
+- Transitive closure is computed via a single bitset-propagation pass
+  over an SCC-condensed dependency DAG (Tarjan + Kahn + int-bitsets),
+  giving O(V+E) performance regardless of output count.
 """
 
 import argparse
@@ -19,10 +24,13 @@ import json
 import re
 import sys
 import time
+import zipfile
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
-from openpyxl import load_workbook
+_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+_RNS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 
 _STRING_RE = re.compile(r'"[^"]*"')
 
@@ -35,6 +43,8 @@ CELL_RE = re.compile(
     r"(?![A-Za-z0-9_.])"
 )
 SHEET_NAME_RE = re.compile(r"^(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_.]*))$")
+COORD_RE = re.compile(r"^([A-Za-z]+)([0-9]+)$")
+REF_RE = re.compile(r"^(\$?)([A-Za-z]+)(\$?)([0-9]+)$")
 
 
 def col_to_index(col_str):
@@ -43,6 +53,119 @@ def col_to_index(col_str):
     for ch in col_str:
         idx = idx * 26 + (ord(ch.upper()) - ord("A") + 1)
     return idx
+
+
+def to_col(idx):
+    chars = []
+    while idx > 0:
+        idx, rem = divmod(idx - 1, 26)
+        chars.append(chr(ord("A") + rem))
+    return "".join(reversed(chars))
+
+
+def split_coord(coord):
+    """'AB12' -> (col_index, row)  both 1-based."""
+    m = COORD_RE.match(coord)
+    return col_to_index(m.group(1)), int(m.group(2))
+
+
+def shift_ref(ref, dc, dr):
+    """Shift a cell reference by (dc, dr); $-anchored parts stay fixed."""
+    m = REF_RE.match(ref)
+    dollar_col, col, dollar_row, row = m.groups()
+    c = col_to_index(col)
+    r = int(row)
+    if not dollar_col:
+        c += dc
+    if not dollar_row:
+        r += dr
+    c = max(1, c)
+    r = max(1, r)
+    return dollar_col + to_col(c) + dollar_row + str(r)
+
+
+def translate_formula(text, master_coord, cell_coord):
+    """Translate a shared-formula master text to a shared cell's position.
+
+    Relative references are shifted by the offset between *master_coord*
+    and *cell_coord*; references anchored with $ keep their position.
+    """
+    m_col, m_row = split_coord(master_coord)
+    c_col, c_row = split_coord(cell_coord)
+    dc = c_col - m_col
+    dr = c_row - m_row
+    if dc == 0 and dr == 0:
+        return text
+
+    def repl(m):
+        sheet_part, start_ref, end_ref = m.group(1), m.group(2), m.group(3)
+        new_start = shift_ref(start_ref, dc, dr)
+        if end_ref:
+            return (sheet_part or "") + new_start + ":" + shift_ref(end_ref, dc, dr)
+        return (sheet_part or "") + new_start
+
+    return CELL_RE.sub(repl, text)
+
+
+def sheet_targets(z):
+    """Return [(sheet_name, worksheet_xml_part), ...] in workbook order."""
+    wb_root = ET.fromstring(z.read("xl/workbook.xml"))
+    rels = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+    targets = {
+        rel.get("Id"): rel.get("Target")
+        for rel in rels
+        if (rel.get("Type") or "").endswith("/worksheet")
+    }
+    sheets = []
+    for s in wb_root.find(_NS + "sheets"):
+        rid = s.get(_RNS + "id")
+        target = targets[rid]
+        if not target.startswith("xl/"):
+            target = "xl/" + target.lstrip("/")
+        sheets.append((s.get("name"), target))
+    return sheets
+
+
+def _iter_sheet_cells(z, target):
+    """Yield (coord, ftype, si, text) for every formula cell in a sheet."""
+    cur = {"coord": None, "has_f": False, "t": None, "si": None, "text": None}
+    for ev, el in ET.iterparse(z.open(target), events=("start", "end")):
+        tag = el.tag
+        if tag == _NS + "c":
+            if ev == "start":
+                cur["coord"] = el.get("r")
+            else:
+                if cur["has_f"]:
+                    yield (cur["coord"], cur["t"], cur["si"], cur["text"])
+                cur["has_f"] = False
+        elif tag == _NS + "f":
+            if ev == "end":
+                cur["has_f"] = True
+                cur["t"] = el.get("t")
+                cur["si"] = el.get("si")
+                cur["text"] = el.text
+        if ev == "end":
+            el.clear()
+
+
+def iter_sheet_formulas(z, target):
+    """Yield (coord, formula) for every formula cell, shared formulas resolved.
+
+    Shared formulas are reconstructed from their master formula with
+    relative references translated to the shared cell's position.
+    """
+    masters = {}
+    for coord, ftype, si, text in _iter_sheet_cells(z, target):
+        if ftype == "shared" and si is not None and text:
+            masters[si] = (coord, text)
+    for coord, ftype, si, text in _iter_sheet_cells(z, target):
+        if text:
+            yield coord, text
+        elif ftype == "shared" and si is not None and si in masters:
+            mcoord, mtext = masters[si]
+            yield coord, translate_formula(mtext, mcoord, coord)
+        else:
+            yield coord, None
 
 
 class FormulaParser:
@@ -126,7 +249,7 @@ class FormulaParser:
     @staticmethod
     def _split_cell(ref):
         ref = ref.replace("$", "")
-        m = re.match(r"^([A-Za-z]+)([0-9]+)$", ref)
+        m = COORD_RE.match(ref)
         return col_to_index(m.group(1)), int(m.group(2))
 
 
@@ -135,42 +258,46 @@ def cell_id(sheet, col, row):
     return f"{sheet}!{to_col(col)}{row}"
 
 
-def to_col(idx):
-    chars = []
-    while idx > 0:
-        idx, rem = divmod(idx - 1, 26)
-        chars.append(chr(ord("A") + rem))
-    return "".join(reversed(chars))
-
-
 class DependencyGraph:
     def __init__(self, workbook_path, output_sheet="Outputs"):
         self.output_sheet = output_sheet
-        # read_only streams the workbook from disk: drastically less memory.
-        self.wb = load_workbook(workbook_path, data_only=False, read_only=True)
         self.direct = {}  # (sheet, col, row) -> set of (sheet, col, row)
         self.dropped_refs = []  # {cell, function, dropped_arg}
         self.output_cells = []  # formula cells on the output sheet
-        self._index()
+        self.output_with_deps = 0  # output formula cells that reference something
+        self._names = {}  # cell -> "SheetName!A1" (built once, reused everywhere)
+        self._transitive_deps = {}  # cell_id_str -> [dep_id_str, ...]
+        with zipfile.ZipFile(workbook_path) as z:
+            self._index(z)
+        self._build_transitive_deps()
 
-    def _index(self):
-        for ws in self.wb.worksheets:
-            parser = FormulaParser(default_sheet=ws.title)
-            is_output = ws.title == self.output_sheet
-            for row in ws.iter_rows():
-                for cell in row:
-                    if not isinstance(cell.value, str) or not cell.value.startswith("="):
-                        continue
-                    key = (ws.title, cell.column, cell.row)
+    def _index(self, z):
+        for sheet_name, target in sheet_targets(z):
+            parser = FormulaParser(default_sheet=sheet_name)
+            is_output = sheet_name == self.output_sheet
+            for coord, ftext in iter_sheet_formulas(z, target):
+                if not ftext:
+                    continue
+                col, row = split_coord(coord)
+                key = (sheet_name, col, row)
+                if is_output:
+                    self.output_cells.append(key)
+                deps, dropped = parser.parse(ftext)
+                for func, arg in dropped:
+                    self.dropped_refs.append(
+                        {"cell": cell_id(*key), "function": func, "dropped_arg": arg}
+                    )
+                if deps:
+                    self.direct[key] = {(sheet, c, r) for sheet, c, r in deps}
                     if is_output:
-                        self.output_cells.append(key)
-                    deps, dropped = parser.parse(cell.value)
-                    for func, arg in dropped:
-                        self.dropped_refs.append(
-                            {"cell": cell_id(*key), "function": func, "dropped_arg": arg}
-                        )
-                    if deps:
-                        self.direct[key] = {(sheet, col, r) for sheet, col, r in deps}
+                        self.output_with_deps += 1
+
+    def _name(self, cell):
+        name = self._names.get(cell)
+        if name is None:
+            name = cell_id(*cell)
+            self._names[cell] = name
+        return name
 
     @staticmethod
     def _in_bounds(cell):
@@ -197,6 +324,173 @@ class DependencyGraph:
         seen.discard(start)
         return seen
 
+    def _build_transitive_deps(self):
+        """Precompute transitive deps for all output cells using bitset propagation.
+
+        Assigns each output cell a bit index, then propagates bitsets through
+        the dependency DAG in one pass.  SCCs (circular references) are
+        condensed first so the DAG traversal is correct even with cycles.
+        """
+        from collections import defaultdict, deque
+
+        n_out = len(self.output_cells)
+        if n_out == 0:
+            return
+
+        sorted_outputs = sorted(self.output_cells)
+        out_idx = {c: i for i, c in enumerate(sorted_outputs)}
+
+        # --- Tarjan SCC on formula cells --------------------------------
+        formula_cells = set(self.direct.keys())
+        saved_limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(max(saved_limit, len(formula_cells) + 1000))
+        try:
+            idx_map = {}
+            low = {}
+            on_stack = set()
+            stk = []
+            counter = [0]
+            sccs = []
+
+            def _sc(v):
+                idx_map[v] = low[v] = counter[0]
+                counter[0] += 1
+                stk.append(v)
+                on_stack.add(v)
+                for w in self.direct.get(v, ()):
+                    if w not in formula_cells:
+                        continue
+                    if w not in idx_map:
+                        _sc(w)
+                        low[v] = min(low[v], low[w])
+                    elif w in on_stack:
+                        low[v] = min(low[v], idx_map[w])
+                if low[v] == idx_map[v]:
+                    scc = []
+                    while True:
+                        w = stk.pop()
+                        on_stack.discard(w)
+                        scc.append(w)
+                        if w == v:
+                            break
+                    sccs.append(scc)
+
+            for cell in formula_cells:
+                if cell not in idx_map:
+                    _sc(cell)
+        finally:
+            sys.setrecursionlimit(saved_limit)
+
+        cell_to_super = {}
+        super_cells = []
+        for scc in sccs:
+            sn = len(super_cells)
+            super_cells.append(scc)
+            for cell in scc:
+                cell_to_super[cell] = sn
+        n_supers = len(super_cells)
+
+        # --- Deps of each super-node (formula + leaf cells) -------------
+        super_dep_cells = [set() for _ in range(n_supers)]
+        for sn, cells in enumerate(super_cells):
+            for cell in cells:
+                super_dep_cells[sn].update(self.direct[cell])
+
+        # --- DAG edges between super-nodes + topological sort -----------
+        dag_adj = [[] for _ in range(n_supers)]
+        in_deg = [0] * n_supers
+        for sn_a in range(n_supers):
+            seen = set()
+            for dep in super_dep_cells[sn_a]:
+                if dep in cell_to_super:
+                    sn_b = cell_to_super[dep]
+                    if sn_b != sn_a and sn_b not in seen:
+                        seen.add(sn_b)
+                        dag_adj[sn_a].append(sn_b)
+                        in_deg[sn_b] += 1
+
+        queue = deque(i for i in range(n_supers) if in_deg[i] == 0)
+        topo = []
+        while queue:
+            sn = queue.popleft()
+            topo.append(sn)
+            for dep_sn in dag_adj[sn]:
+                in_deg[dep_sn] -= 1
+                if in_deg[dep_sn] == 0:
+                    queue.append(dep_sn)
+
+        # --- Bitset propagation (reverse topological) -------------------
+        super_inf = [0] * n_supers
+        leaf_inf = defaultdict(int)
+
+        for cell, idx in out_idx.items():
+            sn = cell_to_super.get(cell)
+            if sn is not None:
+                super_inf[sn] |= 1 << idx
+
+        for sn in topo:
+            bits = super_inf[sn]
+            if not bits:
+                continue
+            for dep in super_dep_cells[sn]:
+                if dep in cell_to_super:
+                    dep_sn = cell_to_super[dep]
+                    if dep_sn != sn:
+                        super_inf[dep_sn] |= bits
+                else:
+                    leaf_inf[dep] |= bits
+
+        # --- Collect (cell, bitset) pairs and build output lists --------
+        all_pairs = []
+        for sn in range(n_supers):
+            bits = super_inf[sn]
+            if bits:
+                for cell in super_cells[sn]:
+                    all_pairs.append((cell, bits))
+        for cell, bits in leaf_inf.items():
+            all_pairs.append((cell, bits))
+
+        if not all_pairs:
+            return
+
+        all_pairs.sort(key=lambda x: x[0])
+
+        cid = {}
+        for cell, _ in all_pairs:
+            cid[cell] = cell_id(*cell)
+        for cell in sorted_outputs:
+            if cell not in cid:
+                cid[cell] = cell_id(*cell)
+
+        out_lists = [[] for _ in range(n_out)]
+        i = 0
+        n_pairs = len(all_pairs)
+        while i < n_pairs:
+            bits = all_pairs[i][1]
+            j = i + 1
+            while j < n_pairs and all_pairs[j][1] == bits:
+                j += 1
+            group_cells = [all_pairs[k][0] for k in range(i, j)]
+            group_set = set(group_cells)
+            b = bits
+            while b:
+                low_bit = b & (-b)
+                idx = low_bit.bit_length() - 1
+                own_cell = sorted_outputs[idx]
+                if own_cell in group_set:
+                    out_lists[idx].extend(
+                        cid[c] for c in group_cells if c != own_cell
+                    )
+                else:
+                    out_lists[idx].extend(cid[c] for c in group_cells)
+                b ^= low_bit
+            i = j
+
+        for i, cell in enumerate(sorted_outputs):
+            deps = out_lists[i]
+            if deps:
+                self._transitive_deps[cid[cell]] = deps
+
 
 def iter_dependency_entries(graph):
     """Yield (cell_id, sorted dep cell ids) for every output cell with deps.
@@ -204,10 +498,14 @@ def iter_dependency_entries(graph):
     Output cells are visited in a deterministic (column, row) order and each
     cell's result is produced and discarded on the fly.
     """
-    for sheet, col, row in sorted(graph.output_cells):
-        deps = graph.trace(sheet, col, row)
-        if deps:
-            yield cell_id(sheet, col, row), sorted(cell_id(*c) for c in deps)
+    if graph._transitive_deps:
+        for cid_str in sorted(graph._transitive_deps):
+            yield cid_str, graph._transitive_deps[cid_str]
+    else:
+        for sheet, col, row in sorted(graph.output_cells):
+            deps = graph.trace(sheet, col, row)
+            if deps:
+                yield cell_id(sheet, col, row), sorted(cell_id(*c) for c in deps)
 
 
 def count_dependency_entries(graph):
@@ -250,16 +548,13 @@ def write_output_file(path, meta, entries):
 
 def process_single(file_path, out_path, output_sheet):
     graph = DependencyGraph(file_path, output_sheet)
-    try:
-        entry_count = count_dependency_entries(graph)
-        meta = workbook_meta(
-            file_path, output_sheet, datetime.now(timezone.utc).isoformat(),
-            len(graph.output_cells), entry_count, graph.dropped_refs,
-        )
-        write_output_file(out_path, meta, iter_dependency_entries(graph))
-    finally:
-        graph.wb.close()
-        del graph
+    entry_count = count_dependency_entries(graph)
+    meta = workbook_meta(
+        file_path, output_sheet, datetime.now(timezone.utc).isoformat(),
+        len(graph.output_cells), entry_count, graph.dropped_refs,
+    )
+    write_output_file(out_path, meta, iter_dependency_entries(graph))
+    del graph
     return meta
 
 
@@ -318,7 +613,6 @@ def process_directory(input_dir, output_dir, output_sheet, merge=False):
                         out_file = output_path / (xlsx_file.stem + "_dependencies.json")
                         write_output_file(out_file, meta, entries)
                 finally:
-                    graph.wb.close()
                     del graph
             except Exception as exc:
                 elapsed = time.time() - t0
