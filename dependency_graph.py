@@ -26,6 +26,7 @@ import sys
 import time
 import zipfile
 import xml.etree.ElementTree as ET
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -562,8 +563,51 @@ def summarize_workbook(graph, name):
           f"{dropped} dynamic refs ignored")
 
 
-def process_single(file_path, out_path, output_sheet, no_save=False):
-    graph = DependencyGraph(file_path, output_sheet)
+def print_skipped_summary(function_file_counts):
+    """Print a table of skipped functions broken down by file."""
+    if not function_file_counts:
+        return
+    files = sorted({f for counts in function_file_counts.values() for f in counts})
+    funcs = sorted(function_file_counts)
+    col_w = max((len(f) for f in funcs), default=0)
+    file_ws = [max(len(f), 5) for f in files]
+    header = "Function".ljust(col_w) + "  " + "  ".join(f.ljust(w) for f, w in zip(files, file_ws)) + "  Total"
+    sep = "=" * len(header)
+    print(f"\n{sep}")
+    print("Skipped functions by file")
+    print(sep)
+    print(header)
+    print("-" * len(header))
+    for func in funcs:
+        counts = function_file_counts[func]
+        total = sum(counts.values())
+        cells = [str(counts.get(f, 0)).rjust(w) for f, w in zip(files, file_ws)]
+        print(f"{func.ljust(col_w)}  {'  '.join(cells)}  {str(total).rjust(5)}")
+    print(sep)
+
+
+def _build_graph_with_timeout(file_path, output_sheet, timeout):
+    if timeout <= 0:
+        return DependencyGraph(file_path, output_sheet)
+    import signal
+
+    def _handler(signum, frame):
+        raise TimeoutError(f"exceeded {timeout}s")
+
+    prev = signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(timeout)
+    try:
+        graph = DependencyGraph(file_path, output_sheet)
+    except TimeoutError:
+        raise
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, prev)
+    return graph
+
+
+def process_single(file_path, out_path, output_sheet, no_save=False, timeout=0):
+    graph = _build_graph_with_timeout(file_path, output_sheet, timeout)
     meta = workbook_meta(
         file_path, output_sheet, datetime.now(timezone.utc).isoformat(),
         len(graph.output_cells), count_dependency_entries(graph), graph.dropped_refs,
@@ -577,7 +621,7 @@ def process_single(file_path, out_path, output_sheet, no_save=False):
     return meta
 
 
-def process_directory(input_dir, output_dir, output_sheet, merge=False, no_save=False):
+def process_directory(input_dir, output_dir, output_sheet, merge=False, no_save=False, timeout=0):
     """Process all *.xlsx files in *input_dir*.
 
     Returns 0 on success (even if some files failed), -1 on fatal error.
@@ -599,6 +643,7 @@ def process_directory(input_dir, output_dir, output_sheet, merge=False, no_save=
     total = len(xlsx_files)
     successful = 0
     failed = 0
+    function_file_counts = defaultdict(lambda: defaultdict(int))
 
     merged_f = None
     first_workbook = True
@@ -611,12 +656,14 @@ def process_directory(input_dir, output_dir, output_sheet, merge=False, no_save=
             t0 = time.time()
             print(f"[{idx}/{total}] Processing: {xlsx_file.name}")
             try:
-                graph = DependencyGraph(str(xlsx_file), output_sheet)
+                graph = _build_graph_with_timeout(str(xlsx_file), output_sheet, timeout)
                 try:
                     meta = workbook_meta(
                         str(xlsx_file), output_sheet, datetime.now(timezone.utc).isoformat(),
                         len(graph.output_cells), count_dependency_entries(graph), graph.dropped_refs,
                     )
+                    for ref in graph.dropped_refs:
+                        function_file_counts[ref["function"]][xlsx_file.name] += 1
                     if no_save:
                         summarize_workbook(graph, xlsx_file.name)
                     else:
@@ -670,6 +717,7 @@ def process_directory(input_dir, output_dir, output_sheet, merge=False, no_save=
 
     total_elapsed = time.time() - batch_t0
     print(f"\nDone. Successful: {successful}, Failed: {failed}, Total: {total} ({total_elapsed:.2f}s)")
+    print_skipped_summary(function_file_counts)
     return 0
 
 
@@ -701,6 +749,10 @@ def main(argv=None):
         "--no-save", action="store_true", default=False,
         help="Calculate only: build the graph and print a summary, write nothing to disk"
     )
+    parser.add_argument(
+        "--timeout", type=int, default=0,
+        help="Max seconds per file (0 = no limit). Skips files that exceed this."
+    )
 
     args = parser.parse_args(argv)
 
@@ -708,10 +760,14 @@ def main(argv=None):
     input_dir = args.input_dir or (args.input if args.input and Path(args.input).is_dir() else None)
     if input_dir is not None and Path(input_dir).is_dir():
         return process_directory(input_dir, args.output_dir, args.output_sheet,
-                                 args.merge, args.no_save)
+                                 args.merge, args.no_save, args.timeout)
 
     # Single-file mode
-    meta = process_single(args.input, args.out, args.output_sheet, args.no_save)
+    try:
+        meta = process_single(args.input, args.out, args.output_sheet, args.no_save, args.timeout)
+    except TimeoutError as exc:
+        print(f"ERROR: skipped — {exc}")
+        return 1
     print(f"Cells traced: {meta['output_cells_with_dependencies']}")
     print(f"Dynamic refs ignored: {len(meta['ignored_dynamic_refs'])}")
     if not args.no_save:
