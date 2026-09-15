@@ -5,7 +5,7 @@
 ## Требования
 
 - Python 3.8+
-- `openpyxl` (`pip install openpyxl`)
+- Сторонних зависимостей нет: только стандартная библиотека (`zipfile`, `xml.etree.ElementTree`, `re`).
 
 ## Запуск
 
@@ -21,6 +21,7 @@ python3 dependency_graph.py [INPUT.xlsx] [-o OUTPUT.json] [--output-sheet SHEET]
 | `--input-dir` | — | Директория с `*.xlsx` для пакетной обработки |
 | `--output-dir` | `results/` | Папка для результатов (пакетный режим) |
 | `--merge` | — | Собрать все результаты в один `merged_dependencies.json` |
+| `--no-save` | — | Только расчёт: построить граф, вывести сводку, ничего не записывать |
 
 ## Запуск (одиночный файл)
 
@@ -41,14 +42,41 @@ python3 dependency_graph.py --input-dir data/ --merge
 python3 dependency_graph.py data/
 ```
 
-Пример вывода:
-```
-[1/12] Processing: 2poj431skazt.xlsx
-  → 142 cells traced, 3 dynamic refs ignored (5.23s)
-[2/12] Processing: 5ugust7zuuzn.xlsx
-  → 98 cells traced, 0 dynamic refs ignored (3.87s)
+## Только расчёт (без записи)
 
-Done. Successful: 12, Failed: 0, Total: 12 (78.45s)
+Режим `--no-save` строит граф и замыкание зависимостей, печатает сводку
+(число формул, выходов, пар «формула → ячейка», отброшенных динамических ссылок)
+и **не пишет ничего на диск**. Подходит для быстрых проверок модели без генерации
+гигабайтных JSON.
+
+```bash
+# Одиночный файл
+python3 dependency_graph.py --no-save data/model.xlsx
+
+# Вся папка
+python3 dependency_graph.py --no-save --input-dir data/
+```
+
+Пример вывода (`--no-save --input-dir data/`):
+```
+[1/2] Processing: 2poj431skazt.xlsx
+  → 2poj431skazt.xlsx: 1076 output formulas, 1076 with deps, 59560806 dep pairs, 3892 dynamic refs ignored
+  ✓ computed (8.91s)
+[2/2] Processing: model.xlsx
+  → model.xlsx: 1479 output formulas, 1479 with deps, 680695 dep pairs, 23 dynamic refs ignored
+  ✓ computed (0.80s)
+
+Done. Successful: 2, Failed: 0, Total: 2 (9.70s)
+```
+
+Пример вывода пакетного режима с записью:
+```
+[1/2] Processing: 2poj431skazt.xlsx
+  → 1076 cells traced, 3892 dynamic refs ignored (15.04s)
+[2/2] Processing: model.xlsx
+  → 1479 cells traced, 23 dynamic refs ignored (0.90s)
+
+Done. Successful: 2, Failed: 0, Total: 2 (15.94s)
 ```
 
 ## Формат результата

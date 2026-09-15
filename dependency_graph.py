@@ -546,28 +546,49 @@ def write_output_file(path, meta, entries):
         f.write('\n  }\n}\n')
 
 
-def process_single(file_path, out_path, output_sheet):
+def total_dep_entries(graph):
+    """Total number of dependency→cell pairs across all output cells."""
+    return sum(len(deps) for deps in graph._transitive_deps.values()) if graph._transitive_deps else 0
+
+
+def summarize_workbook(graph, name):
+    """Print a human-readable summary for one computed workbook."""
+    cells = len(graph.output_cells)
+    with_deps = count_dependency_entries(graph)
+    total = total_dep_entries(graph)
+    dropped = len(graph.dropped_refs)
+    print(f"  → {name}: {cells} output formulas, "
+          f"{with_deps} with deps, {total} dep pairs, "
+          f"{dropped} dynamic refs ignored")
+
+
+def process_single(file_path, out_path, output_sheet, no_save=False):
     graph = DependencyGraph(file_path, output_sheet)
-    entry_count = count_dependency_entries(graph)
     meta = workbook_meta(
         file_path, output_sheet, datetime.now(timezone.utc).isoformat(),
-        len(graph.output_cells), entry_count, graph.dropped_refs,
+        len(graph.output_cells), count_dependency_entries(graph), graph.dropped_refs,
     )
-    write_output_file(out_path, meta, iter_dependency_entries(graph))
+    if no_save:
+        print(f"Calculated: {file_path}")
+        summarize_workbook(graph, Path(file_path).name)
+    else:
+        write_output_file(out_path, meta, iter_dependency_entries(graph))
     del graph
     return meta
 
 
-def process_directory(input_dir, output_dir, output_sheet, merge=False):
+def process_directory(input_dir, output_dir, output_sheet, merge=False, no_save=False):
     """Process all *.xlsx files in *input_dir*.
 
     Returns 0 on success (even if some files failed), -1 on fatal error.
     With --merge the merged file is streamed workbook-by-workbook, so memory
     stays bounded regardless of how many/ how large the workbooks are.
+    With --no-save nothing is written to disk; per-file summaries are printed.
     """
     input_path = Path(input_dir)
     output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
+    if not no_save:
+        output_path.mkdir(parents=True, exist_ok=True)
 
     xlsx_files = sorted(input_path.glob("*.xlsx"))
     if not xlsx_files:
@@ -581,7 +602,7 @@ def process_directory(input_dir, output_dir, output_sheet, merge=False):
 
     merged_f = None
     first_workbook = True
-    if merge:
+    if merge and not no_save:
         merged_f = open(output_path / "merged_dependencies.json", "w", encoding="utf-8")
         merged_f.write('{\n  "workbooks": {')
 
@@ -592,26 +613,28 @@ def process_directory(input_dir, output_dir, output_sheet, merge=False):
             try:
                 graph = DependencyGraph(str(xlsx_file), output_sheet)
                 try:
-                    entry_count = count_dependency_entries(graph)
                     meta = workbook_meta(
                         str(xlsx_file), output_sheet, datetime.now(timezone.utc).isoformat(),
-                        len(graph.output_cells), entry_count, graph.dropped_refs,
+                        len(graph.output_cells), count_dependency_entries(graph), graph.dropped_refs,
                     )
-                    entries = iter_dependency_entries(graph)
-                    if merge:
-                        if not first_workbook:
-                            merged_f.write(",\n")
-                        first_workbook = False
-                        merged_f.write("    ")
-                        json.dump(xlsx_file.name, merged_f, ensure_ascii=False)
-                        merged_f.write(': {\n      "meta": ')
-                        json.dump(meta, merged_f, ensure_ascii=False, separators=(",", ":"))
-                        merged_f.write(',\n      "dependencies": {')
-                        _write_entries(merged_f, entries, indent="        ")
-                        merged_f.write("\n      }\n    }")
+                    if no_save:
+                        summarize_workbook(graph, xlsx_file.name)
                     else:
-                        out_file = output_path / (xlsx_file.stem + "_dependencies.json")
-                        write_output_file(out_file, meta, entries)
+                        entries = iter_dependency_entries(graph)
+                        if merge:
+                            if not first_workbook:
+                                merged_f.write(",\n")
+                            first_workbook = False
+                            merged_f.write("    ")
+                            json.dump(xlsx_file.name, merged_f, ensure_ascii=False)
+                            merged_f.write(': {\n      "meta": ')
+                            json.dump(meta, merged_f, ensure_ascii=False, separators=(",", ":"))
+                            merged_f.write(',\n      "dependencies": {')
+                            _write_entries(merged_f, entries, indent="        ")
+                            merged_f.write("\n      }\n    }")
+                        else:
+                            out_file = output_path / (xlsx_file.stem + "_dependencies.json")
+                            write_output_file(out_file, meta, entries)
                 finally:
                     del graph
             except Exception as exc:
@@ -624,9 +647,12 @@ def process_directory(input_dir, output_dir, output_sheet, merge=False):
 
             elapsed = time.time() - t0
             successful += 1
-            cells = meta["output_cells_with_dependencies"]
-            dropped = len(meta["ignored_dynamic_refs"])
-            print(f"  → {cells} cells traced, {dropped} dynamic refs ignored ({elapsed:.2f}s)")
+            if no_save:
+                print(f"  ✓ computed ({elapsed:.2f}s)")
+            else:
+                cells = meta["output_cells_with_dependencies"]
+                dropped = len(meta["ignored_dynamic_refs"])
+                print(f"  → {cells} cells traced, {dropped} dynamic refs ignored ({elapsed:.2f}s)")
     finally:
         if merged_f is not None:
             merged_meta = {
@@ -671,19 +697,25 @@ def main(argv=None):
         "--merge", action="store_true", default=False,
         help="Merge all results into a single merged_dependencies.json"
     )
+    parser.add_argument(
+        "--no-save", action="store_true", default=False,
+        help="Calculate only: build the graph and print a summary, write nothing to disk"
+    )
 
     args = parser.parse_args(argv)
 
     # Batch mode
     input_dir = args.input_dir or (args.input if args.input and Path(args.input).is_dir() else None)
     if input_dir is not None and Path(input_dir).is_dir():
-        return process_directory(input_dir, args.output_dir, args.output_sheet, args.merge)
+        return process_directory(input_dir, args.output_dir, args.output_sheet,
+                                 args.merge, args.no_save)
 
     # Single-file mode
-    meta = process_single(args.input, args.out, args.output_sheet)
+    meta = process_single(args.input, args.out, args.output_sheet, args.no_save)
     print(f"Cells traced: {meta['output_cells_with_dependencies']}")
     print(f"Dynamic refs ignored: {len(meta['ignored_dynamic_refs'])}")
-    print(f"Written to: {args.out}")
+    if not args.no_save:
+        print(f"Written to: {args.out}")
     return 0
 
 
