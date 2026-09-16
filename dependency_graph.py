@@ -19,6 +19,7 @@ Highlights:
 """
 
 import argparse
+import csv
 import gc
 import json
 import re
@@ -169,6 +170,95 @@ def iter_sheet_formulas(z, target):
             yield coord, None
 
 
+def _load_shared_strings(z):
+    """Return the workbook's shared-string table (rich-text runs joined)."""
+    try:
+        root = ET.fromstring(z.read("xl/sharedStrings.xml"))
+    except KeyError:
+        return []
+    return ["".join(t.text or "" for t in si.iter(_NS + "t")) for si in root]
+
+
+def _cell_text(el, strings):
+    """Textual/numeric value of a <c> element, or None when empty."""
+    t = el.get("t")
+    if t == "inlineStr":
+        is_el = el.find(_NS + "is")
+        if is_el is None:
+            return None
+        return "".join(x.text or "" for x in is_el.iter(_NS + "t"))
+    v = el.find(_NS + "v")
+    if v is None or v.text is None:
+        return None
+    if t == "s":
+        try:
+            return strings[int(v.text)]
+        except (ValueError, IndexError):
+            return None
+    if t == "str":
+        return v.text
+    try:
+        f = float(v.text)
+    except ValueError:
+        return v.text
+    return int(f) if f.is_integer() else f
+
+
+def _detect_name_col(row1, name_header):
+    """Index of the row-1 header cell matching *name_header* (exact, then sub)."""
+    target = name_header.strip().lower()
+    candidates = [(col, val) for col, val in sorted(row1.items())
+                  if isinstance(val, str)]
+    for col, val in candidates:
+        if val.strip().lower() == target:
+            return col
+    for col, val in candidates:
+        if target in val.strip().lower():
+            return col
+    return None
+
+
+def read_sheet_headers(z, target, name_col=None, fallback_col=None,
+                       name_header="Наименование"):
+    """Read row-1 headers and a name column from one worksheet.
+
+    Returns (name_col, years, names):
+      name_col: column index of the "name" column.  Used as given, else
+                detected from the row-1 header text, else *fallback_col*.
+      years:    {col_index: year} for numeric row-1 values > 1000.
+      names:    {row: name} from the name column (rows >= 2).
+    """
+    strings = _load_shared_strings(z)
+    row1 = {}
+    names = {}
+    detected = name_col
+    explicit = name_col is not None
+    for ev, el in ET.iterparse(z.open(target), events=("end",)):
+        tag = el.tag
+        if tag == _NS + "c":
+            m = COORD_RE.match(el.get("r") or "")
+            if m is not None:
+                col = col_to_index(m.group(1))
+                row = int(m.group(2))
+                if row == 1:
+                    row1[col] = _cell_text(el, strings)
+                elif detected is not None and col == detected:
+                    val = _cell_text(el, strings)
+                    if val not in (None, ""):
+                        names[row] = val
+            el.clear()
+        elif tag == _NS + "row":
+            if not explicit and detected is None and el.get("r") == "1":
+                detected = _detect_name_col(row1, name_header) or fallback_col
+            el.clear()
+    if detected is None:
+        detected = fallback_col
+    years = {c: v for c, v in row1.items()
+             if isinstance(v, (int, float)) and not isinstance(v, bool)
+             and v > 1000}
+    return detected, years, names
+
+
 class FormulaParser:
     def __init__(self, default_sheet):
         self.default_sheet = default_sheet
@@ -261,6 +351,7 @@ def cell_id(sheet, col, row):
 
 class DependencyGraph:
     def __init__(self, workbook_path, output_sheet="Outputs"):
+        self.workbook_path = workbook_path
         self.output_sheet = output_sheet
         self.direct = {}  # (sheet, col, row) -> set of (sheet, col, row)
         self.dropped_refs = []  # {cell, function, dropped_arg}
@@ -271,6 +362,15 @@ class DependencyGraph:
         with zipfile.ZipFile(workbook_path) as z:
             self._index(z)
         self._build_transitive_deps()
+
+    def read_headers(self, sheet_name, name_col=None, fallback_col=None):
+        """Read row-1 years + name column for *sheet_name* (for CSV output)."""
+        with zipfile.ZipFile(self.workbook_path) as z:
+            for name, target in sheet_targets(z):
+                if name == sheet_name:
+                    return read_sheet_headers(z, target, name_col=name_col,
+                                              fallback_col=fallback_col)
+        raise KeyError(f"sheet not found: {sheet_name!r}")
 
     def _index(self, z):
         for sheet_name, target in sheet_targets(z):
@@ -552,6 +652,121 @@ def total_dep_entries(graph):
     return sum(len(deps) for deps in graph._transitive_deps.values()) if graph._transitive_deps else 0
 
 
+def parse_year_range(args):
+    """Effective (lo, hi) from --years / --from / --to; None = no limit.
+
+    Mirrors sensitivity2.py: 'FROM:TO' (bounds may be open), a bare YEAR,
+    or --from/--to as plain integers.
+    """
+    if args.years and (args.from_year is not None or args.to_year is not None):
+        raise ValueError("--years cannot be combined with --from/--to")
+    lo = hi = None
+    if args.years:
+        s = args.years.strip()
+        m = re.fullmatch(r"(\d*)\s*:\s*(\d*)", s)
+        if m:
+            lo = int(m.group(1)) if m.group(1) else None
+            hi = int(m.group(2)) if m.group(2) else None
+            if lo is None and hi is None:
+                raise ValueError("--years ':' defines no range")
+        elif re.fullmatch(r"\d+", s):
+            lo = hi = int(s)
+        else:
+            raise ValueError("--years expects FROM:TO, FROM:, :TO or YEAR")
+    if args.from_year is not None:
+        lo = args.from_year
+    if args.to_year is not None:
+        hi = args.to_year
+    if lo is not None and hi is not None and lo > hi:
+        raise ValueError("--from must be <= --to")
+    if lo is None and hi is None:
+        return None
+    return lo, hi
+
+
+def fmt_years(years):
+    """Human-readable form of a (lo, hi) range tuple or None."""
+    if years is None:
+        return "all"
+    lo, hi = years
+    return "%s..%s" % ("-" if lo is None else lo, "+" if hi is None else hi)
+
+
+def _parse_cell_id(cell_id_str):
+    """'Sheet!A1' -> ('Sheet', col_index, row); tolerant of '!' in sheet names."""
+    sheet, sep, coord = cell_id_str.rpartition("!")
+    if not sep:
+        sheet, coord = "", cell_id_str
+    m = COORD_RE.match(coord)
+    if m is None:
+        return sheet, None, None
+    return sheet, col_to_index(m.group(1)), int(m.group(2))
+
+
+def _local_ref(col, row):
+    return f"{to_col(col)}{row}"
+
+
+def iter_input_output_rows(graph, input_sheet, in_hdr, out_hdr,
+                           years_filter=None):
+    """Yield CSV rows: Inputs cell -> transitive Output cell.
+
+    Both endpoints are constrained like sensitivity2.py: the cell must sit
+    in a year column and its row must carry a name in the name column.
+    *years_filter* restricts the input year (outputs are never filtered).
+    """
+    in_name_col, in_years, in_names = in_hdr
+    out_name_col, out_years, out_names = out_hdr
+    lo, hi = years_filter if years_filter is not None else (None, None)
+    rows = []
+    for out_str, dep_strs in iter_dependency_entries(graph):
+        o_sheet, o_col, o_row = _parse_cell_id(out_str)
+        if o_col is None:
+            continue
+        o_year = out_years.get(o_col)
+        o_name = out_names.get(o_row)
+        if o_year is None or not o_name:
+            continue
+        for d_str in dep_strs:
+            d_sheet, d_col, d_row = _parse_cell_id(d_str)
+            if d_col is None or d_sheet != input_sheet:
+                continue
+            i_year = in_years.get(d_col)
+            i_name = in_names.get(d_row)
+            if i_year is None or not i_name:
+                continue
+            if (lo is not None and i_year < lo) or (hi is not None and i_year > hi):
+                continue
+            rows.append((d_row, i_year, o_row, o_year, (
+                _local_ref(d_col, d_row), i_name, i_year,
+                _local_ref(o_col, o_row), o_name, o_year,
+            )))
+    rows.sort(key=lambda item: item[:4])
+    return [rec for *_, rec in rows]
+
+
+CSV_HEADER = ["input_cell", "input_name", "input_year",
+              "output_cell", "output_name", "output_year"]
+
+
+def write_csv(path, rows):
+    """Write Inputs->Outputs pairs as UTF-8-BOM CSV (Excel friendly)."""
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(CSV_HEADER)
+        w.writerows(rows)
+
+
+def build_csv_rows(graph, input_sheet, output_sheet, input_name_col=None,
+                   output_name_col=None, years=None):
+    """Read headers and produce the Inputs->Outputs CSV rows for one graph."""
+    in_hdr = graph.read_headers(input_sheet, name_col=input_name_col,
+                                fallback_col=6)
+    out_hdr = graph.read_headers(output_sheet, name_col=output_name_col,
+                                 fallback_col=5)
+    return iter_input_output_rows(graph, input_sheet, in_hdr, out_hdr, years)
+
+
 def summarize_workbook(graph, name):
     """Print a human-readable summary for one computed workbook."""
     cells = len(graph.output_cells)
@@ -634,7 +849,9 @@ def _build_graph_with_timeout(file_path, output_sheet, timeout):
     return graph
 
 
-def process_single(file_path, out_path, output_sheet, no_save=False, timeout=0):
+def process_single(file_path, out_path, output_sheet, no_save=False, timeout=0,
+                   do_json=True, do_csv=False, csv_out=None, input_sheet="Inputs",
+                   input_name_col=None, output_name_col=None, years=None):
     graph = _build_graph_with_timeout(file_path, output_sheet, timeout)
     meta = workbook_meta(
         file_path, output_sheet, datetime.now(timezone.utc).isoformat(),
@@ -644,12 +861,22 @@ def process_single(file_path, out_path, output_sheet, no_save=False, timeout=0):
         print(f"Calculated: {file_path}")
         summarize_workbook(graph, Path(file_path).name)
     else:
-        write_output_file(out_path, meta, iter_dependency_entries(graph))
+        if do_json:
+            write_output_file(out_path, meta, iter_dependency_entries(graph))
+        if do_csv:
+            rows = build_csv_rows(graph, input_sheet, output_sheet,
+                                  input_name_col, output_name_col, years)
+            path = csv_out or Path(out_path).with_suffix(".csv")
+            write_csv(path, rows)
+            print(f"CSV: {len(rows)} Inputs->Outputs pairs → {path}")
     del graph
     return meta
 
 
-def process_directory(input_dir, output_dir, output_sheet, merge=False, no_save=False, timeout=0, transpose=False):
+def process_directory(input_dir, output_dir, output_sheet, merge=False, no_save=False,
+                      timeout=0, transpose=False, do_json=True, do_csv=False,
+                      input_sheet="Inputs", input_name_col=None,
+                      output_name_col=None, years=None):
     """Process all *.xlsx files in *input_dir*.
 
     Returns 0 on success (even if some files failed), -1 on fatal error.
@@ -661,6 +888,8 @@ def process_directory(input_dir, output_dir, output_sheet, merge=False, no_save=
     output_path = Path(output_dir)
     if not no_save:
         output_path.mkdir(parents=True, exist_ok=True)
+        if do_csv and not merge:
+            (output_path / "per_file").mkdir(parents=True, exist_ok=True)
 
     xlsx_files = sorted(input_path.glob("*.xlsx"))
     if not xlsx_files:
@@ -672,10 +901,11 @@ def process_directory(input_dir, output_dir, output_sheet, merge=False, no_save=
     successful = 0
     failed = 0
     function_file_counts = defaultdict(lambda: defaultdict(int))
+    merged_csv_rows = []
 
     merged_f = None
     first_workbook = True
-    if merge and not no_save:
+    if merge and not no_save and do_json:
         merged_f = open(output_path / "merged_dependencies.json", "w", encoding="utf-8")
         merged_f.write('{\n  "workbooks": {')
 
@@ -695,21 +925,31 @@ def process_directory(input_dir, output_dir, output_sheet, merge=False, no_save=
                     if no_save:
                         summarize_workbook(graph, xlsx_file.name)
                     else:
-                        entries = iter_dependency_entries(graph)
-                        if merge:
-                            if not first_workbook:
-                                merged_f.write(",\n")
-                            first_workbook = False
-                            merged_f.write("    ")
-                            json.dump(xlsx_file.name, merged_f, ensure_ascii=False)
-                            merged_f.write(': {\n      "meta": ')
-                            json.dump(meta, merged_f, ensure_ascii=False, separators=(",", ":"))
-                            merged_f.write(',\n      "dependencies": {')
-                            _write_entries(merged_f, entries, indent="        ")
-                            merged_f.write("\n      }\n    }")
-                        else:
-                            out_file = output_path / (xlsx_file.stem + "_dependencies.json")
-                            write_output_file(out_file, meta, entries)
+                        if do_json:
+                            entries = iter_dependency_entries(graph)
+                            if merge:
+                                if not first_workbook:
+                                    merged_f.write(",\n")
+                                first_workbook = False
+                                merged_f.write("    ")
+                                json.dump(xlsx_file.name, merged_f, ensure_ascii=False)
+                                merged_f.write(': {\n      "meta": ')
+                                json.dump(meta, merged_f, ensure_ascii=False, separators=(",", ":"))
+                                merged_f.write(',\n      "dependencies": {')
+                                _write_entries(merged_f, entries, indent="        ")
+                                merged_f.write("\n      }\n    }")
+                            else:
+                                out_file = output_path / (xlsx_file.stem + "_dependencies.json")
+                                write_output_file(out_file, meta, entries)
+                        if do_csv:
+                            rows = build_csv_rows(graph, input_sheet, output_sheet,
+                                                  input_name_col, output_name_col, years)
+                            if merge:
+                                merged_csv_rows.extend(rows)
+                            else:
+                                csv_file = output_path / "per_file" / (xlsx_file.stem + ".csv")
+                                write_csv(csv_file, rows)
+                                print(f"  CSV: {len(rows)} Inputs->Outputs pairs → {csv_file.name}")
                 finally:
                     del graph
             except Exception as exc:
@@ -742,6 +982,11 @@ def process_directory(input_dir, output_dir, output_sheet, merge=False, no_save=
             json.dump(merged_meta, merged_f, ensure_ascii=False, indent=2)
             merged_f.write("\n}\n")
             merged_f.close()
+
+    if merge and do_csv and not no_save:
+        csv_file = output_path / "inputs_outputs.csv"
+        write_csv(csv_file, merged_csv_rows)
+        print(f"CSV: {len(merged_csv_rows)} Inputs->Outputs pairs → {csv_file}")
 
     total_elapsed = time.time() - batch_t0
     print(f"\nDone. Successful: {successful}, Failed: {failed}, Total: {total} ({total_elapsed:.2f}s)")
@@ -786,23 +1031,86 @@ def main(argv=None):
         help="Transpose the skipped-functions table: files in rows, functions in columns"
     )
 
+    # Output-format selection (JSON and CSV are independent)
+    parser.add_argument(
+        "--json", action="store_true", default=False,
+        help="Write JSON output (default when neither --json nor --csv is given)"
+    )
+    parser.add_argument(
+        "--csv", action="store_true", default=False,
+        help="Write CSV of Inputs->Outputs pairs (input_cell,...,output_year)"
+    )
+    parser.add_argument(
+        "--csv-out", default=None,
+        help="Output CSV path (single-file mode; default: <out>.csv)"
+    )
+
+    # Inputs->Outputs CSV layout
+    parser.add_argument(
+        "--input-sheet", default="Inputs",
+        help="Sheet holding input cells (default: Inputs)"
+    )
+    parser.add_argument(
+        "--input-name-col", default=None,
+        help="Column letter with input names (default: auto-detect 'Наименование')"
+    )
+    parser.add_argument(
+        "--output-name-col", default=None,
+        help="Column letter with output names (default: auto-detect 'Наименование')"
+    )
+    parser.add_argument(
+        "--years", metavar="FROM:TO",
+        help="Restrict input years to a span: FROM:TO, FROM:, :TO or a single YEAR"
+    )
+    parser.add_argument(
+        "--from", dest="from_year", type=int, metavar="YEAR",
+        help="First input year to include"
+    )
+    parser.add_argument(
+        "--to", dest="to_year", type=int, metavar="YEAR",
+        help="Last input year to include"
+    )
+
     args = parser.parse_args(argv)
+
+    if args.input_name_col:
+        args.input_name_col = col_to_index(args.input_name_col)
+    if args.output_name_col:
+        args.output_name_col = col_to_index(args.output_name_col)
+    try:
+        years = parse_year_range(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    # JSON is the default; --csv alone switches to CSV-only.
+    do_json = args.json or not args.csv
+    do_csv = args.csv
 
     # Batch mode
     input_dir = args.input_dir or (args.input if args.input and Path(args.input).is_dir() else None)
     if input_dir is not None and Path(input_dir).is_dir():
-        return process_directory(input_dir, args.output_dir, args.output_sheet,
-                                 args.merge, args.no_save, args.timeout, args.transpose)
+        return process_directory(
+            input_dir, args.output_dir, args.output_sheet,
+            args.merge, args.no_save, args.timeout, args.transpose,
+            do_json=do_json, do_csv=do_csv, input_sheet=args.input_sheet,
+            input_name_col=args.input_name_col,
+            output_name_col=args.output_name_col, years=years,
+        )
 
     # Single-file mode
     try:
-        meta = process_single(args.input, args.out, args.output_sheet, args.no_save, args.timeout)
+        meta = process_single(
+            args.input, args.out, args.output_sheet, args.no_save, args.timeout,
+            do_json=do_json, do_csv=do_csv, csv_out=args.csv_out,
+            input_sheet=args.input_sheet, input_name_col=args.input_name_col,
+            output_name_col=args.output_name_col, years=years,
+        )
     except TimeoutError as exc:
         print(f"ERROR: skipped — {exc}")
         return 1
     print(f"Cells traced: {meta['output_cells_with_dependencies']}")
     print(f"Dynamic refs ignored: {len(meta['ignored_dynamic_refs'])}")
-    if not args.no_save:
+    if not args.no_save and do_json:
         print(f"Written to: {args.out}")
     return 0
 

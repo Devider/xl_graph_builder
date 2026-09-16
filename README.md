@@ -22,6 +22,16 @@ python3 dependency_graph.py [INPUT.xlsx] [-o OUTPUT.json] [--output-sheet SHEET]
 | `--output-dir` | `results/` | Папка для результатов (пакетный режим) |
 | `--merge` | — | Собрать все результаты в один `merged_dependencies.json` |
 | `--no-save` | — | Только расчёт: построить граф, вывести сводку, ничего не записывать |
+| `--timeout N` | `0` | Пропускать файл, если построение графа заняло больше N секунд (0 = без лимита) |
+| `--transpose` | — | Развернуть таблицу пропущенных функций (файлы в строках) |
+| `--json` | — | Писать JSON (по умолчанию, если не указан ни `--json`, ни `--csv`) |
+| `--csv` | — | Писать CSV пар `Inputs → Outputs` |
+| `--csv-out` | — | Путь CSV в одиночном режиме (по умолчанию `<out>.csv`) |
+| `--input-sheet` | `Inputs` | Лист входных ячеек для CSV |
+| `--input-name-col` | авто | Колонка имён входов (по умолчанию ищется заголовок «Наименование») |
+| `--output-name-col` | авто | Колонка имён выходов (по умолчанию ищется заголовок «Наименование») |
+| `--years FROM:TO` | — | Ограничить годы входов (`FROM:TO`, `FROM:`, `:TO` или `YEAR`) |
+| `--from YEAR` / `--to YEAR` | — | Границы годов входов |
 
 ## Запуск (одиночный файл)
 
@@ -97,6 +107,37 @@ Done. Successful: 2, Failed: 0, Total: 2 (15.94s)
   }
 }
 ```
+
+## CSV-выход (пары Inputs → Outputs)
+
+Флаг `--csv` включает CSV, совместимый по ключу с `xl_stat/sensitivity2.py`:
+одна строка на пару «вход → выход», только транзитивные предки с листа
+`--input-sheet`, у которых есть имя в колонке имён и год в строке 1.
+Колонки (`utf-8-sig`, открывается в Excel):
+
+```
+input_cell,input_name,input_year,output_cell,output_name,output_year
+AF4,"Инфляция - Рост индекса потребительских цен в США...",2023,M3,Операционные расходы (без амортизации),2023
+```
+
+```bash
+# одиночный файл → model.csv
+python3 dependency_graph.py data/model.xlsx --csv
+
+# батч → results/per_file/<stem>.csv
+python3 dependency_graph.py --input-dir data/ --output-dir results/ --csv
+
+# батч + слияние → results/inputs_outputs.csv
+python3 dependency_graph.py --input-dir data/ --output-dir results/ --csv --merge
+
+# и JSON, и CSV
+python3 dependency_graph.py data/model.xlsx --json --csv
+```
+
+`--csv` без `--json` пишет только CSV; без обоих флагов по умолчанию пишется JSON.
+Колонки имён определяются динамически по заголовку «Наименование» в строке 1
+(переопределяются `--input-name-col` / `--output-name-col`). `--years/--from/--to`
+ограничивают годы входов, как в `sensitivity2.py`.
 
 ## Ограничения
 
